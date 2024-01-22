@@ -5,21 +5,22 @@ import torch.nn.functional as F
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from torch.cuda.amp import custom_bwd, custom_fwd
 
-class SpecifyGradient(torch.autograd.Function):
-    @staticmethod
-    @custom_fwd
-    def forward(ctx, input_tensor, gt_grad):
-        ctx.save_for_backward(gt_grad)
-        # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
-        # return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
-        return input_tensor
+# Abandoned
+# class SpecifyGradient(torch.autograd.Function):
+#     @staticmethod
+#     @custom_fwd
+#     def forward(ctx, input_tensor, gt_grad):
+#         ctx.save_for_backward(gt_grad)
+#         # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
+#         # return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
+#         return input_tensor
 
-    @staticmethod
-    @custom_bwd
-    def backward(ctx, grad_scale):
-        gt_grad, = ctx.saved_tensors
-        gt_grad = gt_grad * grad_scale
-        return gt_grad, None
+#     @staticmethod
+#     @custom_bwd
+#     def backward(ctx, grad_scale):
+#         gt_grad, = ctx.saved_tensors
+#         gt_grad = gt_grad * grad_scale
+#         return gt_grad, None
 
 class StableDiffusion(nn.Module):
     def __init__(self, model_key, device, fp16, vram_O, t_range=[0.02, 0.98]):
@@ -74,7 +75,7 @@ class StableDiffusion(nn.Module):
             latents = self.encode_imgs(pred_rgb_512)
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+        t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), dtype=torch.long, device=self.device)
 
         # predict the noise residual with unet, NO grad!
         with torch.no_grad():
@@ -83,29 +84,20 @@ class StableDiffusion(nn.Module):
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
-            # Save input tensors for UNet
-            #torch.save(latent_model_input, "train_latent_model_input.pt")
-            #torch.save(t, "train_t.pt")
-            #torch.save(text_embeddings, "train_text_embeddings.pt")
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            tt = torch.cat([t] * 2)
+            noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
 
-        # perform guidance (high scale from paper!)
-        noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
+            # perform guidance (high scale from paper!)
+            noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
 
         # w(t), sigma_t^2
         w = (1 - self.alphas[t])
-        # print(w * ((noise_pred - noise) ** 2).sum())
-        grad = grad_scale * w * (noise_pred - noise)
+        grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
 
-        with torch.no_grad():
-            true_loss = w * (noise_pred - noise) ** 2
-            true_loss = torch.mean(true_loss)
-
-        # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        loss = SpecifyGradient.apply(true_loss, grad)
+        targets = (latents - grad).detach()
+        loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
 
         return loss
 
